@@ -5,6 +5,14 @@ import { User } from "../model/user.model.js";
 import jwt from "jsonwebtoken"
 import { sendRegistrationEmail } from "../services/mail.service.js";
 import { Slot } from "../model/slot.model.js";
+import { DoctorProfile } from "../model/doctorProfile.model.js";
+import { getBucket } from "../config/gridfs.js";
+
+const getTodayDate = () => {
+    return new Date().toLocaleDateString("en-CA", {
+        timeZone: "Asia/Kolkata"
+    });
+};
 
 export const Register = async (req, res) => {
     try {
@@ -36,7 +44,7 @@ export const Register = async (req, res) => {
                 purpose: "email-activation"
             },
             process.env.JWT_SECRET,
-            { expiresIn: "15m" }
+            { expiresIn: "1d" }
         );
 
         await sendRegistrationEmail(
@@ -186,17 +194,14 @@ export const getMe = async (req, res) => {
 export const createSlot = async (req, res) => {
     try {
         const { date, startTime, endTime } = req.body;
-
         const doctorId = req.user.id;
 
-        // 1. Check whether all fields are provided
         if (!date || !startTime || !endTime) {
             return res.status(400).json({
                 message: "All fields are required"
             });
         }
 
-        // 2. Check date and time formats
         const datePattern = /^\d{4}-\d{2}-\d{2}$/;
         const timePattern = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 
@@ -210,7 +215,6 @@ export const createSlot = async (req, res) => {
             });
         }
 
-        // 3. Check whether the date actually exists
         const [year, month, day] = date.split("-").map(Number);
 
         const isValidDate =
@@ -226,14 +230,19 @@ export const createSlot = async (req, res) => {
             });
         }
 
-        // 4. Check whether end time is greater than start time
+        // Prevent adding previous dates
+        if (date < getTodayDate()) {
+            return res.status(400).json({
+                message: "You cannot add slots for previous dates"
+            });
+        }
+
         if (startTime >= endTime) {
             return res.status(400).json({
                 message: "End time must be greater than start time"
             });
         }
 
-        // 5. Check whether the new slot overlaps with an existing slot
         const existingSlot = await Slot.findOne({
             doctorId,
             date,
@@ -247,7 +256,6 @@ export const createSlot = async (req, res) => {
             });
         }
 
-        // 6. Create the new slot
         const newSlot = await Slot.create({
             doctorId,
             date,
@@ -264,18 +272,26 @@ export const createSlot = async (req, res) => {
         console.log("Create slot error:", error);
 
         return res.status(500).json({
-            message: "Error adding slot"
+            message: "Error creating slot"
         });
     }
 };
 
-// Get all slots of the logged-in doctor
+
+
+// Get slots of the logged-in doctor by selected date
 export const getSlots = async (req, res) => {
     try {
         const doctorId = req.user.id;
 
-        const slots = await Slot.find({ doctorId })
-            .sort({ date: 1, startTime: 1 });
+        // Get selected date from frontend
+        const { date } = req.query;
+
+        // Find doctor's slots
+        const slots = await Slot.find({
+            doctorId,
+            ...(date && { date })
+        }).sort({ startTime: 1 });
 
         return res.status(200).json({
             status: true,
@@ -294,27 +310,42 @@ export const getSlots = async (req, res) => {
 
 export const DeleteSlot = async (req, res) => {
     try {
+        // Get slot ID from URL
         const { id } = req.params;
-        const { doctorId } = req.user.id;
-        const slotFound = await Slot.findOne({ _id: id, doctorId })
-        if (!slotFound) {
-            return res.status(500).json({
-                message: "Error slots NOT FOUND"
-            });
-        }
-        if (slotFound.status === "booked") {
-            return res.status(500).json({
-                message: "Error slot already booked"
+
+        // Get logged-in doctor's ID
+        const doctorId = req.user.id;
+
+        // Find the slot belonging to this doctor
+        const slot = await Slot.findOne({
+            _id: id,
+            doctorId: doctorId
+        });
+
+        // Check whether slot exists
+        if (!slot) {
+            return res.status(404).json({
+                message: "Slot not found"
             });
         }
 
-        await Slot.findOneAndDelete({
+        // Prevent deleting booked slots
+        if (slot.status === "booked") {
+            return res.status(400).json({
+                message: "Cannot delete a booked slot"
+            });
+        }
+
+        // Delete the slot
+        await Slot.deleteOne({
             _id: id,
-            doctorId
+            doctorId: doctorId
         });
+
         return res.status(200).json({
             message: "Slot deleted successfully"
         });
+
     } catch (error) {
         console.log("Delete slot error:", error);
 
@@ -322,29 +353,20 @@ export const DeleteSlot = async (req, res) => {
             message: "Error deleting slot"
         });
     }
-
-}
-
+};
 
 export const UpdateSlot = async (req, res) => {
     try {
-        // Get slot ID from URL
         const { id } = req.params;
-
-        // Get updated details from request body
         const { date, startTime, endTime } = req.body;
-
-        // Get logged-in doctor's ID
         const doctorId = req.user.id;
 
-        // 1. Check all fields
         if (!date || !startTime || !endTime) {
             return res.status(400).json({
                 message: "All fields are required"
             });
         }
 
-        // 2. Validate date and time format
         const datePattern = /^\d{4}-\d{2}-\d{2}$/;
         const timePattern = /^(?:[01]\d|2[0-3]):[0-5]\d$/;
 
@@ -358,7 +380,6 @@ export const UpdateSlot = async (req, res) => {
             });
         }
 
-        // 3. Check whether the date actually exists
         const [year, month, day] = date.split("-").map(Number);
 
         const isValidDate =
@@ -374,14 +395,19 @@ export const UpdateSlot = async (req, res) => {
             });
         }
 
-        // 4. Check start and end time
+        // Prevent updating to previous dates
+        if (date < getTodayDate()) {
+            return res.status(400).json({
+                message: "You cannot update slots to previous dates"
+            });
+        }
+
         if (startTime >= endTime) {
             return res.status(400).json({
                 message: "End time must be greater than start time"
             });
         }
 
-        // 5. Find the slot belonging to this doctor
         const slotFound = await Slot.findOne({
             _id: id,
             doctorId
@@ -393,14 +419,12 @@ export const UpdateSlot = async (req, res) => {
             });
         }
 
-        // 6. Do not update booked slots
         if (slotFound.status === "booked") {
             return res.status(400).json({
                 message: "Booked slots cannot be updated"
             });
         }
 
-        // 7. Check whether the updated time overlaps another slot
         const existingSlot = await Slot.findOne({
             _id: { $ne: id },
             doctorId,
@@ -415,12 +439,10 @@ export const UpdateSlot = async (req, res) => {
             });
         }
 
-        // 8. Update the slot values
         slotFound.date = date;
         slotFound.startTime = startTime;
         slotFound.endTime = endTime;
 
-        // Save changes in MongoDB
         await slotFound.save();
 
         return res.status(200).json({
@@ -437,4 +459,328 @@ export const UpdateSlot = async (req, res) => {
     }
 };
 
+
+
+//doctor
+
+export const createDoctorProfile = async (req, res) => {
+    try {
+        const {
+            description,
+            specialization,
+            qualification,
+            experience,
+            consultationFee
+        } = req.body;
+
+        const doctorId = req.user.id;
+
+        if (
+            !description ||
+            !specialization ||
+            !qualification ||
+            experience === undefined ||
+            consultationFee === undefined
+        ) {
+            return res.status(400).json({
+                message: "All fields are required"
+            });
+        }
+
+        const existingProfile = await DoctorProfile.findOne({ doctorId });
+
+        if (existingProfile) {
+            return res.status(400).json({
+                message: "Doctor profile already exists"
+            });
+        }
+
+        // Upload image to GridFS
+        let imageId = null;
+
+        if (req.file) {
+            const bucket = getBucket();
+
+            const uploadStream = bucket.openUploadStream(
+                req.file.originalname
+            );
+
+            await new Promise((resolve, reject) => {
+                uploadStream.on("finish", resolve);
+                uploadStream.on("error", reject);
+
+                uploadStream.end(req.file.buffer);
+            });
+
+            imageId = uploadStream.id;
+        }
+
+        // Save image ID along with doctor profile
+        const newProfile = await DoctorProfile.create({
+            doctorId,
+            description,
+            specialization,
+            qualification,
+            experience,
+            consultationFee,
+            profileImage: imageId
+        });
+
+        return res.status(201).json({
+            message: "Doctor profile created successfully",
+            profile: newProfile
+        });
+
+    } catch (error) {
+        console.log("Create doctor profile error:", error);
+
+        return res.status(500).json({
+            message: "Error creating doctor profile"
+        });
+    }
+};
+
+
+
+export const getAllDoctors = async (req, res) => {
+    try {
+        const doctors = await DoctorProfile.find()
+            .populate("doctorId", "name");
+
+        return res.status(200).json({
+            message: "Doctors fetched successfully",
+            count: doctors.length,
+            doctors
+        });
+
+    } catch (error) {
+        console.log("Get doctors error:", error);
+
+        return res.status(500).json({
+            message: "Error fetching doctors"
+        });
+    }
+};
+
+
+
+export const getDoctorAvailableSlots = async (req, res) => {
+    try {
+        const { doctorId } = req.params;
+        const { date } = req.query;
+
+        const now = new Date();
+
+        const today =
+            `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-${String(now.getDate()).padStart(2, "0")}`;
+
+        // Start with the selected doctor's available slots
+        const filter = {
+            doctorId,
+            status: "available",
+            date: date ? date : { $gte: today }
+        };
+
+        // If the patient selects today, hide past time slots
+        if (date === today) {
+            const currentTime =
+                `${String(now.getHours()).padStart(2, "0")}:${String(now.getMinutes()).padStart(2, "0")}`;
+
+            filter.startTime = { $gt: currentTime };
+        }
+
+        const slots = await Slot.find(filter).sort({
+            date: 1,
+            startTime: 1
+        });
+
+        return res.status(200).json({
+            message: "Available slots fetched successfully",
+            count: slots.length,
+            slots
+        });
+
+    } catch (error) {
+        console.log("Get available slots error:", error);
+
+        return res.status(500).json({
+            message: "Error fetching available slots"
+        });
+    }
+};
+
+
+
+export const bookAppointment = async (req, res) => {
+    try {
+        // Get slot ID from URL
+        const { slotId } = req.params;
+
+        // Get patient ID from logged-in user's token
+        const patientId = req.user.id;
+
+        // Find and book the slot in one operation
+        const slot = await Slot.findOneAndUpdate(
+            {
+                _id: slotId,
+                status: "available"
+            },
+            {
+                $set: {
+                    status: "booked",
+                    patientId: patientId
+                }
+            },
+            {
+                new: true
+            }
+        );
+
+        // Check whether slot was available
+        if (!slot) {
+            return res.status(404).json({
+                message: "Slot is not available or does not exist"
+            });
+        }
+
+        return res.status(200).json({
+            message: "Appointment booked successfully",
+            appointment: slot
+        });
+
+    } catch (error) {
+        console.log("Booking error:", error);
+
+        return res.status(500).json({
+            message: "Error booking appointment"
+        });
+    }
+};
+
+
+export const getMyAppointments = async (req, res) => {
+    try {
+        const patientId = req.user.id;
+
+        const appointments = await Slot.find({
+            patientId: patientId,
+            status: "booked"
+        })
+            .populate("doctorId", "name")
+            .sort({
+                date: 1,
+                startTime: 1
+            });
+
+        return res.status(200).json({
+            message: "Appointments fetched successfully",
+            count: appointments.length,
+            appointments
+        });
+
+    } catch (error) {
+        console.log("Get appointments error:", error);
+
+        return res.status(500).json({
+            message: "Error fetching appointments"
+        });
+    }
+};
+
+
+export const cancelAppointment = async (req, res) => {
+    try {
+        const { slotId } = req.params;
+
+        const patientId = req.user.id;
+
+        const slot = await Slot.findOneAndUpdate(
+            {
+                _id: slotId,
+                patientId,
+                status: "booked"
+            },
+            {
+                $set: {
+                    status: "available",
+                    patientId: null
+                }
+            },
+            {
+                new: true
+            }
+        );
+
+        if (!slot) {
+            return res.status(404).json({
+                message: "Appointment not found"
+            });
+        }
+
+
+        return res.status(200).json({
+            message: "Appointment cancelled successfully",
+            appointment: slot
+        });
+
+    } catch (error) {
+        console.log("Cancel appointment error:", error);
+
+        return res.status(500).json({
+            message: "Error cancelling appointment"
+        });
+    }
+};
+
+export const getDoctorAppointments = async (req, res) => {
+    try {
+        const doctorId = req.user.id;
+
+        const appointments = await Slot.find({
+            doctorId,
+            status: "booked"
+        }).populate("patientId", "name email");
+
+        return res.status(200).json({
+            message: "Appointments fetched successfully",
+            count: appointments.length,
+            appointments
+        });
+
+    } catch (error) {
+        console.log(error);
+
+        return res.status(500).json({
+            message: "Error fetching appointments"
+        });
+    }
+};
+
+
+export const getDoctorImage = async (req, res) => {
+    try {
+        const { imageId } = req.params;
+        
+        const bucket = getBucket();
+
+        const downloadStream = bucket.openDownloadStream(
+            new mongoose.Types.ObjectId(imageId)
+        );
+
+        downloadStream.on("error", () => {
+            return res.status(404).json({
+                message: "Image not found"
+            });
+        });
+
+        downloadStream.pipe(res);
+
+    } catch (error) {
+        console.log("Get doctor image error:", error);
+
+        return res.status(500).json({
+            message: "Error fetching image"
+        });
+    }
+};
 

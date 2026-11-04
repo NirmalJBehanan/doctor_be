@@ -2,6 +2,11 @@
 import mongoose from "mongoose";
 
 const slotModel = new mongoose.Schema({
+    patientId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        default: null
+    },
     doctorId: {
         type: mongoose.Schema.Types.ObjectId,
         ref: "User",
