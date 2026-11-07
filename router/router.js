@@ -1,10 +1,15 @@
 
 import express from "express";
 import {
+    getMyAppointmentHistory
+} from "../controller/Doctor.controller.js";
+import {
     activation,
     bookAppointment,
     cancelAppointment,
+    cancelPendingPayment,
     createDoctorProfile,
+    createPaymentOrder,
     createSlot,
     DeleteSlot,
     getAllDoctors,
@@ -16,7 +21,9 @@ import {
     getSlots,
     login,
     Register,
-    UpdateSlot
+    updateAppointmentStatus,
+    UpdateSlot,
+    verifyPayment
 } from "../controller/Doctor.controller.js";
 
 import { middleware } from "../middleware/auth.middleware.js";
@@ -36,9 +43,26 @@ router.put("/updateSlot/:id", middleware, doctorOnly, UpdateSlot);
 router.post("/createDoctorProfile",middleware,doctorOnly,upload.single("image"),createDoctorProfile);
 router.get("/getAllDoctors", getAllDoctors);
 router.get("/availableSlots/:doctorId",getDoctorAvailableSlots);
-router.post("/bookAppointment/:slotId",middleware,bookAppointment);
+
 router.get("/myAppointments",middleware,getMyAppointments);
 router.patch("/cancelAppointment/:slotId",middleware,cancelAppointment);
 router.get("/doctorAppointments",middleware,doctorOnly,getDoctorAppointments);
 router.get("/doctor-image/:imageId", getDoctorImage);
+router.patch("/updateAppointmentStatus/:slotId",middleware,doctorOnly,updateAppointmentStatus);
+
+router.post( "/createPaymentOrder/:slotId", middleware, createPaymentOrder);
+
+router.post("/verifyPayment",middleware,verifyPayment);
+
+
+router.patch(
+    "/cancelPendingPayment/:slotId",
+    middleware,
+    cancelPendingPayment
+);
+router.get(
+    "/myAppointmentHistory",
+    middleware,
+    getMyAppointmentHistory
+);
 export default router;

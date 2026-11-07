@@ -29,6 +29,11 @@ const slotModel = new mongoose.Schema({
         enum: ["available", "booked", "blocked"],
         default: "available",
         required: true
+    },
+    appointmentStatus: {
+        type: String,
+        enum: ["pending", "confirmed", "completed", "cancelled"],
+        default: "pending"
     }
 },
     {

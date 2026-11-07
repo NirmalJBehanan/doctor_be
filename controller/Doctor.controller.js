@@ -7,12 +7,20 @@ import { sendRegistrationEmail } from "../services/mail.service.js";
 import { Slot } from "../model/slot.model.js";
 import { DoctorProfile } from "../model/doctorProfile.model.js";
 import { getBucket } from "../config/gridfs.js";
-
+import Razorpay from "razorpay";
+import crypto from "crypto";
+import { Payment } from "../model/payment.model.js";
+import { Appointment } from "../model/appointment.model.js";
 const getTodayDate = () => {
     return new Date().toLocaleDateString("en-CA", {
         timeZone: "Asia/Kolkata"
     });
 };
+
+const razorpay = new Razorpay({
+    key_id: process.env.RAZORPAY_KEY_ID,
+    key_secret: process.env.RAZORPAY_KEY_SECRET
+});
 
 export const Register = async (req, res) => {
     try {
@@ -611,15 +619,13 @@ export const getDoctorAvailableSlots = async (req, res) => {
 
 
 
+
 export const bookAppointment = async (req, res) => {
     try {
-        // Get slot ID from URL
         const { slotId } = req.params;
-
-        // Get patient ID from logged-in user's token
         const patientId = req.user.id;
 
-        // Find and book the slot in one operation
+        // 1. Book available slot
         const slot = await Slot.findOneAndUpdate(
             {
                 _id: slotId,
@@ -628,7 +634,8 @@ export const bookAppointment = async (req, res) => {
             {
                 $set: {
                     status: "booked",
-                    patientId: patientId
+                    appointmentStatus: "pending",
+                    patientId
                 }
             },
             {
@@ -636,16 +643,27 @@ export const bookAppointment = async (req, res) => {
             }
         );
 
-        // Check whether slot was available
         if (!slot) {
             return res.status(404).json({
                 message: "Slot is not available or does not exist"
             });
         }
 
+        // 2. Create Appointment history
+        const appointment = await Appointment.create({
+            patientId,
+            doctorId: slot.doctorId,
+            slotId: slot._id,
+            paymentId: null,
+            date: slot.date,
+            startTime: slot.startTime,
+            endTime: slot.endTime,
+            status: "pending"
+        });
+
         return res.status(200).json({
             message: "Appointment booked successfully",
-            appointment: slot
+            appointment
         });
 
     } catch (error) {
@@ -656,6 +674,7 @@ export const bookAppointment = async (req, res) => {
         });
     }
 };
+
 
 
 export const getMyAppointments = async (req, res) => {
@@ -688,28 +707,19 @@ export const getMyAppointments = async (req, res) => {
 };
 
 
+
+
 export const cancelAppointment = async (req, res) => {
     try {
         const { slotId } = req.params;
-
         const patientId = req.user.id;
 
-        const slot = await Slot.findOneAndUpdate(
-            {
-                _id: slotId,
-                patientId,
-                status: "booked"
-            },
-            {
-                $set: {
-                    status: "available",
-                    patientId: null
-                }
-            },
-            {
-                new: true
-            }
-        );
+        // 1. Find currently booked slot
+        const slot = await Slot.findOne({
+            _id: slotId,
+            patientId,
+            status: "booked"
+        });
 
         if (!slot) {
             return res.status(404).json({
@@ -717,26 +727,85 @@ export const cancelAppointment = async (req, res) => {
             });
         }
 
+        if (
+            slot.appointmentStatus === "completed" ||
+            slot.appointmentStatus === "cancelled"
+        ) {
+            return res.status(400).json({
+                message: "This appointment cannot be cancelled"
+            });
+        }
+
+        // 2. Find the matching active Appointment
+        const appointment = await Appointment.findOne({
+            slotId: slot._id,
+            patientId,
+            doctorId: slot.doctorId,
+            status: { $in: ["pending", "confirmed"] }
+        }).sort({ createdAt: -1 });
+
+        if (!appointment) {
+            return res.status(404).json({
+                message: "Appointment history record not found"
+            });
+        }
+
+        // 3. Refund only this appointment's payment
+        const refund = await refundAppointmentPayment(
+            slot,
+            appointment.paymentId
+        );
+
+        // 4. Update Appointment history
+        appointment.status = "cancelled";
+        appointment.cancelledBy = "patient";
+        appointment.cancelledAt = new Date();
+
+        await appointment.save();
+
+        // 5. Release slot for another patient
+        slot.status = "available";
+        slot.patientId = null;
+        slot.appointmentStatus = "cancelled";
+
+        await slot.save();
 
         return res.status(200).json({
             message: "Appointment cancelled successfully",
-            appointment: slot
+            refundStatus: refund.refundStatus,
+            appointment
         });
 
     } catch (error) {
         console.log("Cancel appointment error:", error);
 
         return res.status(500).json({
-            message: "Error cancelling appointment"
+            message: error.message || "Error cancelling appointment"
         });
     }
 };
+
+
+
 
 export const getDoctorAppointments = async (req, res) => {
     try {
         const doctorId = req.user.id;
 
+        // 1. Find all successful payments of this doctor
+        const paidPayments = await Payment.find({
+            doctorId,
+            status: "paid"
+        }).select("slotId");
+
+        // 2. Get slot IDs from those payments
+        const paidSlotIds = paidPayments.map(
+            (payment) => payment.slotId
+        );
+
+        // 3. Find only appointments with successful payments
         const appointments = await Slot.find({
+            _id: { $in: paidSlotIds },
             doctorId,
             status: "booked"
         }).populate("patientId", "name email");
@@ -748,7 +817,7 @@ export const getDoctorAppointments = async (req, res) => {
         });
 
     } catch (error) {
-        console.log(error);
+        console.log("Get doctor appointments error:", error);
 
         return res.status(500).json({
             message: "Error fetching appointments"
@@ -757,10 +826,11 @@ export const getDoctorAppointments = async (req, res) => {
 };
 
 
+
 export const getDoctorImage = async (req, res) => {
     try {
         const { imageId } = req.params;
-        
+
         const bucket = getBucket();
 
         const downloadStream = bucket.openDownloadStream(
@@ -784,3 +854,633 @@ export const getDoctorImage = async (req, res) => {
     }
 };
 
+
+
+
+
+
+
+
+
+
+export const updateAppointmentStatus = async (req, res) => {
+    try {
+        const { slotId } = req.params;
+        const { appointmentStatus } = req.body;
+        const doctorId = req.user.id;
+
+        const allowedStatuses = [
+            "confirmed",
+            "completed",
+            "cancelled"
+        ];
+
+        if (!allowedStatuses.includes(appointmentStatus)) {
+            return res.status(400).json({
+                message: "Invalid appointment status"
+            });
+        }
+
+        // 1. Find booked slot
+        const slot = await Slot.findOne({
+            _id: slotId,
+            doctorId,
+            status: "booked"
+        });
+
+        if (!slot) {
+            return res.status(404).json({
+                message: "Appointment not found"
+            });
+        }
+
+        if (
+            slot.appointmentStatus === "completed" ||
+            slot.appointmentStatus === "cancelled"
+        ) {
+            return res.status(400).json({
+                message: "This appointment can no longer be updated"
+            });
+        }
+
+        // 2. Find corresponding Appointment history
+        const appointment = await Appointment.findOne({
+            slotId: slot._id,
+            patientId: slot.patientId,
+            doctorId,
+            status: { $in: ["pending", "confirmed"] }
+        }).sort({ createdAt: -1 });
+
+        if (!appointment) {
+            return res.status(404).json({
+                message: "Appointment history record not found"
+            });
+        }
+
+        let refundStatus = null;
+
+        // 3. Doctor cancels appointment
+        if (appointmentStatus === "cancelled") {
+            const refund = await refundAppointmentPayment(
+                slot,
+                appointment.paymentId
+            );
+
+            refundStatus = refund.refundStatus;
+
+            appointment.cancelledBy = "doctor";
+            appointment.cancelledAt = new Date();
+        }
+
+        // 4. Confirm or complete only after successful payment
+        if (
+            appointmentStatus === "confirmed" ||
+            appointmentStatus === "completed"
+        ) {
+            const payment = appointment.paymentId
+                ? await Payment.findOne({
+                    _id: appointment.paymentId,
+                    patientId: slot.patientId,
+                    doctorId,
+                    slotId: slot._id,
+                    status: "paid"
+                })
+                : null;
+
+            if (!payment) {
+                return res.status(400).json({
+                    message: "Payment has not been completed"
+                });
+            }
+        }
+
+        // 5. Update Appointment history
+        appointment.status = appointmentStatus;
+
+        await appointment.save();
+
+        // 6. Update current Slot
+        slot.appointmentStatus = appointmentStatus;
+
+        if (appointmentStatus === "cancelled") {
+            slot.status = "available";
+            slot.patientId = null;
+        }
+
+        await slot.save();
+
+        return res.status(200).json({
+            message: "Appointment status updated successfully",
+            refundStatus,
+            appointment
+        });
+
+    } catch (error) {
+        console.log("Update appointment status error:", error);
+
+        return res.status(500).json({
+            message: error.message || "Error updating appointment status"
+        });
+    }
+};
+
+
+
+
+
+
+export const createPaymentOrder = async (req, res) => {
+    let reservedSlotId = null;
+    let createdPaymentId = null;
+    let createdAppointmentId = null;
+
+    const patientId = req.user.id;
+
+    try {
+        const { slotId } = req.params;
+
+        // 1. Find available slot
+        const slot = await Slot.findOne({
+            _id: slotId,
+            status: "available"
+        });
+
+        if (!slot) {
+            return res.status(404).json({
+                message: "This slot is not available"
+            });
+        }
+
+        // 2. Find doctor's profile
+        const doctorProfile = await DoctorProfile.findOne({
+            doctorId: slot.doctorId
+        });
+
+        if (!doctorProfile) {
+            return res.status(404).json({
+                message: "Doctor profile not found"
+            });
+        }
+
+        // 3. Get consultation fee
+        const amount = Number(doctorProfile.consultationFee);
+
+        if (!Number.isFinite(amount) || amount <= 0) {
+            return res.status(400).json({
+                message: "Invalid consultation fee"
+            });
+        }
+
+        // 4. Reserve slot
+        const bookedSlot = await Slot.findOneAndUpdate(
+            {
+                _id: slotId,
+                status: "available"
+            },
+            {
+                $set: {
+                    patientId,
+                    status: "booked",
+                    appointmentStatus: "pending"
+                }
+            },
+            {
+                new: true
+            }
+        );
+
+        if (!bookedSlot) {
+            return res.status(409).json({
+                message: "Sorry, this slot was just booked by someone else"
+            });
+        }
+
+        reservedSlotId = bookedSlot._id;
+
+        // 5. Create Razorpay order
+        const order = await razorpay.orders.create({
+            amount: Math.round(amount * 100),
+            currency: "INR",
+            receipt: `slot_${bookedSlot._id}`
+        });
+
+        // 6. Create Payment document
+        const payment = await Payment.create({
+            patientId,
+            doctorId: bookedSlot.doctorId,
+            slotId: bookedSlot._id,
+            amount,
+            razorpayOrderId: order.id,
+            status: "created"
+        });
+
+        createdPaymentId = payment._id;
+
+        // 7. Create Appointment document
+        const appointment = await Appointment.create({
+            patientId,
+            doctorId: bookedSlot.doctorId,
+            slotId: bookedSlot._id,
+            paymentId: payment._id,
+            date: bookedSlot.date,
+            startTime: bookedSlot.startTime,
+            endTime: bookedSlot.endTime,
+            status: "pending"
+        });
+
+        createdAppointmentId = appointment._id;
+
+        // 8. Send order details to React
+        return res.status(201).json({
+            message: "Payment order created successfully",
+            orderId: order.id,
+            amount: order.amount,
+            currency: order.currency,
+            keyId: process.env.RAZORPAY_KEY_ID
+        });
+
+    } catch (error) {
+        console.log("Create payment order error:", error);
+
+        // Mark Payment as failed
+        if (createdPaymentId) {
+            await Payment.findByIdAndUpdate(
+                createdPaymentId,
+                { status: "failed" }
+            );
+        }
+
+        // Mark Appointment as cancelled if it was created
+        if (createdAppointmentId) {
+            await Appointment.findByIdAndUpdate(
+                createdAppointmentId,
+                {
+                    status: "cancelled",
+                    cancelledBy: "patient",
+                    cancelledAt: new Date()
+                }
+            );
+        }
+
+        // Release reserved slot
+        if (reservedSlotId) {
+            await Slot.findOneAndUpdate(
+                {
+                    _id: reservedSlotId,
+                    patientId,
+                    status: "booked",
+                    appointmentStatus: "pending"
+                },
+                {
+                    $set: {
+                        patientId: null,
+                        status: "available",
+                        appointmentStatus: "cancelled"
+                    }
+                }
+            );
+        }
+
+        return res.status(500).json({
+            message: "Error creating payment order"
+        });
+    }
+};
+
+
+
+
+export const verifyPayment = async (req, res) => {
+    try {
+        const {
+            razorpay_order_id,
+            razorpay_payment_id,
+            razorpay_signature
+        } = req.body;
+
+        const patientId = req.user.id;
+
+        // 1. Check required details
+        if (
+            !razorpay_order_id ||
+            !razorpay_payment_id ||
+            !razorpay_signature
+        ) {
+            return res.status(400).json({
+                message: "Payment details are required"
+            });
+        }
+
+        // 2. Find payment record
+        const payment = await Payment.findOne({
+            razorpayOrderId: razorpay_order_id,
+            patientId
+        });
+
+        if (!payment) {
+            return res.status(404).json({
+                message: "Payment record not found"
+            });
+        }
+
+        if (payment.status === "paid") {
+            return res.status(400).json({
+                message: "Payment already completed"
+            });
+        }
+
+        // 3. Check the appointment
+        const slot = await Slot.findOne({
+            _id: payment.slotId,
+            patientId,
+            status: "booked",
+            appointmentStatus: "pending"
+        });
+
+        if (!slot) {
+            return res.status(404).json({
+                message: "Booked appointment not found"
+            });
+        }
+
+        // 4. Generate payment signature
+        const generatedSignature = crypto
+            .createHmac(
+                "sha256",
+                process.env.RAZORPAY_KEY_SECRET
+            )
+            .update(
+                razorpay_order_id + "|" + razorpay_payment_id
+            )
+            .digest("hex");
+
+        // 5. Verify signature
+        if (generatedSignature !== razorpay_signature) {
+            return res.status(400).json({
+                message: "Invalid payment signature"
+            });
+        }
+
+        // 6. Update payment details
+        payment.razorpayPaymentId = razorpay_payment_id;
+        payment.razorpaySignature = razorpay_signature;
+        payment.status = "paid";
+
+        await payment.save();
+
+        return res.status(200).json({
+            message: "Payment successful",
+            payment
+        });
+
+    } catch (error) {
+        console.log("Verify payment error:", error);
+
+        return res.status(500).json({
+            message: "Error verifying payment"
+        });
+    }
+};
+
+
+
+
+
+const refundAppointmentPayment = async (slot, paymentId) => {
+
+    // Legacy appointment without a payment
+    if (!paymentId) {
+        return {
+            refundStatus: "not_required"
+        };
+    }
+
+    // Find only the payment linked to this appointment
+    const payment = await Payment.findOne({
+        _id: paymentId,
+        slotId: slot._id,
+        patientId: slot.patientId,
+        doctorId: slot.doctorId
+    });
+
+    if (!payment) {
+        throw new Error("Payment record not found");
+    }
+
+    // No refund is needed for an unpaid or failed payment
+    if (payment.status !== "paid") {
+        return {
+            refundStatus: "not_required"
+        };
+    }
+
+    // Already processed
+    if (payment.refundStatus === "processed") {
+        return {
+            refundStatus: "processed"
+        };
+    }
+
+    // Already waiting for Razorpay
+    if (payment.refundStatus === "pending") {
+        return {
+            refundStatus: "pending"
+        };
+    }
+
+    try {
+        if (!payment.razorpayPaymentId) {
+            throw new Error("Razorpay payment ID not found");
+        }
+
+        // Check actual payment status
+        const razorpayPayment = await razorpay.payments.fetch(
+            payment.razorpayPaymentId
+        );
+
+        if (razorpayPayment.status !== "captured") {
+            throw new Error(
+                `Payment is not captured: ${razorpayPayment.status}`
+            );
+        }
+
+        // Check whether a refund already exists
+        const existingRefunds =
+            await razorpay.payments.fetchMultipleRefund(
+                payment.razorpayPaymentId
+            );
+
+        if (existingRefunds.items?.length > 0) {
+            const existingRefund = existingRefunds.items[0];
+
+            payment.razorpayRefundId = existingRefund.id;
+
+            payment.refundStatus =
+                existingRefund.status === "processed"
+                    ? "processed"
+                    : existingRefund.status === "failed"
+                        ? "failed"
+                        : "pending";
+
+            await payment.save();
+
+            return {
+                refundStatus: payment.refundStatus
+            };
+        }
+
+        // Request a new refund
+        const refund = await razorpay.payments.refund(
+            payment.razorpayPaymentId
+        );
+
+        payment.razorpayRefundId = refund.id;
+
+        payment.refundStatus =
+            refund.status === "processed"
+                ? "processed"
+                : refund.status === "failed"
+                    ? "failed"
+                    : "pending";
+
+        await payment.save();
+
+        return {
+            refundStatus: payment.refundStatus
+        };
+
+    } catch (error) {
+        console.log("Refund error:", error);
+
+        // Do not assume the refund failed if Razorpay's response
+        // was lost. Check Razorpay Dashboard before retrying.
+        throw new Error(
+            "Refund status could not be confirmed. Please check Razorpay."
+        );
+    }
+};
+
+
+
+
+
+
+export const cancelPendingPayment = async (req, res) => {
+    try {
+        const { slotId } = req.params;
+        const patientId = req.user.id;
+
+        // 1. Find pending payment
+        const payment = await Payment.findOne({
+            slotId,
+            patientId,
+            status: "created"
+        }).sort({ createdAt: -1 });
+
+        if (!payment) {
+            return res.status(404).json({
+                message: "Pending payment not found"
+            });
+        }
+
+        // 2. Check Razorpay before releasing the slot
+        const orderPayments = await razorpay.orders.fetchPayments(
+            payment.razorpayOrderId
+        );
+
+        const hasSuccessfulPayment = orderPayments.items?.some(
+            (item) =>
+                item.status === "captured" ||
+                item.status === "authorized"
+        );
+
+        if (hasSuccessfulPayment) {
+            return res.status(409).json({
+                message: "Payment is processing. Please refresh your appointments."
+            });
+        }
+
+        // 3. Mark payment as failed
+        payment.status = "failed";
+        await payment.save();
+
+        // 4. Update the matching Appointment
+        const appointment = await Appointment.findOne({
+            paymentId: payment._id,
+            patientId
+        });
+
+        if (appointment) {
+            appointment.status = "cancelled";
+            appointment.cancelledBy = "patient";
+            appointment.cancelledAt = new Date();
+
+            await appointment.save();
+        }
+
+        // 5. Release the slot
+        const slot = await Slot.findOneAndUpdate(
+            {
+                _id: slotId,
+                patientId,
+                status: "booked",
+                appointmentStatus: "pending"
+            },
+            {
+                $set: {
+                    status: "available",
+                    patientId: null,
+                    appointmentStatus: "cancelled"
+                }
+            },
+            { new: true }
+        );
+
+        if (!slot) {
+            return res.status(409).json({
+                message: "Slot could not be released"
+            });
+        }
+
+        return res.status(200).json({
+            message: "Unpaid reservation cancelled. Slot is available again."
+        });
+
+    } catch (error) {
+        console.log("Cancel pending payment error:", error);
+
+        return res.status(500).json({
+            message: "Could not cancel pending payment"
+        });
+    }
+};
+
+
+export const getMyAppointmentHistory = async (req, res) => {
+    try {
+        const patientId = req.user.id;
+
+        const appointments = await Appointment.find({
+            patientId
+        })
+            .populate("doctorId", "name")
+            .populate(
+                "paymentId",
+                "amount status refundStatus razorpayRefundId razorpayPaymentId"
+            )
+            .sort({ createdAt: -1 });
+
+        return res.status(200).json({
+            message: "Appointment history fetched successfully",
+            count: appointments.length,
+            appointments
+        });
+
+    } catch (error) {
+        console.log("Get appointment history error:", error);
+
+        return res.status(500).json({
+            message: "Error fetching appointment history"
+        });
+    }
+};
