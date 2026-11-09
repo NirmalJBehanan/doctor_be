@@ -531,7 +531,8 @@ export const createDoctorProfile = async (req, res) => {
             qualification,
             experience,
             consultationFee,
-            profileImage: imageId
+            profileImage: imageId,
+            isApproved: true
         });
 
         return res.status(201).json({

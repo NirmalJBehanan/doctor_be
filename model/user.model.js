@@ -20,12 +20,16 @@ const userModel = new mongoose.Schema(
         },
         role: {
             type: String,
-            enum: ["user","doctor","admin"],
+            enum: ["user", "doctor", "admin"],
             default: "user"
         },
-        isverified:{
-            type:Boolean,
-            default:false
+        isverified: {
+            type: Boolean,
+            default: false
+        },
+        isActive: {
+            type: Boolean,
+            default: true
         }
     },
     {

@@ -38,6 +38,10 @@ const doctorProfileSchema = new mongoose.Schema(
         profileImage: {
             type: mongoose.Schema.Types.ObjectId,
             default: null
+        },
+        isApproved: {
+            type: Boolean,
+            default: false
         }
     },
     {

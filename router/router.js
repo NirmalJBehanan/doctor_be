@@ -65,4 +65,7 @@ router.get(
     middleware,
     getMyAppointmentHistory
 );
+
+
+
 export default router;
