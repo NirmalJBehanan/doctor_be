@@ -1,7 +1,12 @@
 
 import express from "express";
 import {
-    getMyAppointmentHistory
+    forgotPassword,
+    getMyAppointmentHistory,
+    getPatientProfile,
+    resetPassword,
+    updateMyDoctorProfile,
+    
 } from "../controller/Doctor.controller.js";
 import {
     activation,
@@ -66,6 +71,18 @@ router.get(
     getMyAppointmentHistory
 );
 
+router.post("/forgotPassword", forgotPassword);
+router.post("/resetPassword/:token", resetPassword);
+
+router.put(
+    "/updateDoctorProfile",
+    middleware,
+    doctorOnly,
+    upload.single("image"),
+    updateMyDoctorProfile
+);
+
+router.get("/patientProfile", middleware, getPatientProfile);
 
 
 export default router;

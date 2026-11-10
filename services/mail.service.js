@@ -43,7 +43,45 @@ export const sendRegistrationEmail = async (email, name, activationToken) => {
     return result;
 };
 
+// Password reset email
+// Password reset email
+export const sendPasswordResetEmail = async (email, name, resetToken) => {
 
+    const resetLink = `http://localhost:5173/reset/${resetToken}`;
+
+    const result = await brevo.transactionalEmails.sendTransacEmail({
+        subject: "MediSlot - Password Reset",
+
+        sender: {
+            name: process.env.brevo_sender_name,
+            email: process.env.brevo_sender_email,
+        },
+
+        to: [
+            {
+                email: email,
+            },
+        ],
+
+        htmlContent: `
+            <h2>Hello ${name},</h2>
+
+            <p>We received a request to reset your password.</p>
+
+            <p>Click the link below to create a new password:</p>
+
+            <a href="${resetLink}">
+                Reset Password
+            </a>
+
+            <p>This link will expire in 15 minutes.</p>
+
+            <p>If you did not request this, please ignore this email.</p>
+        `
+    });
+
+    return result;
+};
 // Doctor credentials email
 export const sendDoctorCredentialsEmail = async (email, name, password) => {
 

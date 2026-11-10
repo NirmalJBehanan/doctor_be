@@ -3,7 +3,7 @@ import bcrypt from "bcrypt";
 import mongoose from "mongoose";
 import { User } from "../model/user.model.js";
 import jwt from "jsonwebtoken"
-import { sendRegistrationEmail } from "../services/mail.service.js";
+import { sendPasswordResetEmail, sendRegistrationEmail } from "../services/mail.service.js";
 import { Slot } from "../model/slot.model.js";
 import { DoctorProfile } from "../model/doctorProfile.model.js";
 import { getBucket } from "../config/gridfs.js";
@@ -212,6 +212,7 @@ export const Register = async (req, res) => {
 };
 
 
+
 export const login = async (req, res) => {
     try {
         const { email, password } = req.body;
@@ -310,9 +311,90 @@ export const activation = async (req, res) => {
     }
 };
 
-export const getMe = async (req, res) => {
+export const forgotPassword = async (req, res) => {
     try {
-        const user = await User.findById(req.user.id);
+        const { email } = req.body;
+
+        if (!email) {
+            return res.status(400).json({
+                message: "Email is required"
+            });
+        }
+
+        // Find patient or doctor using the same User model
+        const user = await User.findOne({
+            email: email.toLowerCase().trim()
+        });
+
+        // Do not reveal whether an email is registered
+        if (!user) {
+            return res.status(200).json({
+                message: "If this email is registered, a reset link will be sent."
+            });
+        }
+
+        // Generate password reset token
+        const resetToken = jwt.sign(
+            {
+                id: user._id,
+                purpose: "password-reset"
+            },
+            process.env.JWT_SECRET,
+            { expiresIn: "15m" }
+        );
+
+        // Send reset link through Brevo
+        await sendPasswordResetEmail(
+            user.email,
+            user.name,
+            resetToken
+        );
+
+        return res.status(200).json({
+            message: "Password reset link sent to your email."
+        });
+
+    } catch (error) {
+        console.log("Forgot password error:", error);
+
+        return res.status(500).json({
+            message: "Could not send password reset email"
+        });
+    }
+};
+
+export const resetPassword = async (req, res) => {
+    try {
+        const { token } = req.params;
+        const { password } = req.body;
+
+        if (!password) {
+            return res.status(400).json({
+                message: "New password is required"
+            });
+        }
+
+        if (password.length < 6) {
+            return res.status(400).json({
+                message: "Password must contain at least 6 characters"
+            });
+        }
+
+        // Verify reset token
+        const decoded = jwt.verify(
+            token,
+            process.env.JWT_SECRET
+        );
+
+        // Check token purpose
+        if (decoded.purpose !== "password-reset") {
+            return res.status(400).json({
+                message: "Invalid password reset token"
+            });
+        }
+
+        // Find user
+        const user = await User.findById(decoded.id);
 
         if (!user) {
             return res.status(404).json({
@@ -320,14 +402,57 @@ export const getMe = async (req, res) => {
             });
         }
 
-        res.status(200).json({
+        // Hash new password
+        const hashedPassword = await bcrypt.hash(password, 10);
+
+        user.password = hashedPassword;
+
+        await user.save();
+
+        return res.status(200).json({
+            message: "Password reset successfully. Please log in."
+        });
+
+    } catch (error) {
+        console.log("Reset password error:", error);
+
+        if (
+            error.name === "TokenExpiredError" ||
+            error.name === "JsonWebTokenError"
+        ) {
+            return res.status(400).json({
+                message: "Reset link is invalid or expired. Please request a new one."
+            });
+        }
+
+        return res.status(500).json({
+            message: "Could not reset password"
+        });
+    }
+};
+
+export const getMe = async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id).select("-password");
+
+        if (!user) {
+            return res.status(404).json({
+                message: "User not found"
+            });
+        }
+
+        let doctorProfile = null;
+
+        if (user.role === "doctor") {
+            doctorProfile = await DoctorProfile.findOne({
+                doctorId: user._id
+            });
+        }
+
+        return res.status(200).json({
             status: true,
-            user: {
-                id: user._id,
-                name: user.name,
-                email: user.email,
-                role: user.role
-            }
+            user,
+            doctorProfile
         });
 
     } catch (error) {
@@ -649,7 +774,12 @@ export const createDoctorProfile = async (req, res) => {
             const bucket = getBucket();
 
             const uploadStream = bucket.openUploadStream(
-                req.file.originalname
+                req.file.originalname,
+                {
+                    metadata: {
+                        contentType: req.file.mimetype
+                    }
+                }
             );
 
             await new Promise((resolve, reject) => {
@@ -684,6 +814,74 @@ export const createDoctorProfile = async (req, res) => {
 
         return res.status(500).json({
             message: "Error creating doctor profile"
+        });
+    }
+};
+
+
+export const updateMyDoctorProfile = async (req, res) => {
+    try {
+        const doctorId = req.user.id;
+
+        // Find the logged-in doctor's profile
+        const profile = await DoctorProfile.findOne({ doctorId });
+
+        if (!profile) {
+            return res.status(404).json({
+                message: "Doctor profile not found"
+            });
+        }
+
+        // Update profile details
+        const {
+            description,
+            specialization,
+            qualification,
+            experience,
+            consultationFee
+        } = req.body;
+
+        if (description !== undefined) profile.description = description;
+        if (specialization !== undefined) profile.specialization = specialization;
+        if (qualification !== undefined) profile.qualification = qualification;
+        if (experience !== undefined) profile.experience = experience;
+        if (consultationFee !== undefined) profile.consultationFee = consultationFee;
+
+        // Update image if a new image is uploaded
+        if (req.file) {
+            const bucket = getBucket();
+
+            const uploadStream = bucket.openUploadStream(
+                req.file.originalname,
+                {
+                    metadata: {
+                        contentType: req.file.mimetype
+                    }
+                }
+            );
+
+            uploadStream.end(req.file.buffer);
+
+            await new Promise((resolve, reject) => {
+                uploadStream.on("finish", resolve);
+                uploadStream.on("error", reject);
+            });
+
+            profile.profileImage = uploadStream.id;
+        }
+
+        await profile.save();
+
+        return res.status(200).json({
+            message: "Doctor profile updated successfully",
+            profile
+        });
+
+    } catch (error) {
+        console.log("Update doctor profile error:", error);
+
+        return res.status(500).json({
+            message: "Internal server error"
         });
     }
 };
@@ -988,14 +1186,33 @@ export const getDoctorImage = async (req, res) => {
 
         const bucket = getBucket();
 
-        const downloadStream = bucket.openDownloadStream(
-            new mongoose.Types.ObjectId(imageId)
-        );
+        const objectId = new mongoose.Types.ObjectId(imageId);
 
-        downloadStream.on("error", () => {
+        const files = await bucket.find({
+            _id: objectId
+        }).toArray();
+
+        if (!files.length) {
             return res.status(404).json({
                 message: "Image not found"
             });
+        }
+
+        res.set(
+            "Content-Type",
+            files[0].metadata?.contentType || "application/octet-stream"
+        );
+
+        const downloadStream = bucket.openDownloadStream(objectId);
+
+        downloadStream.on("error", (error) => {
+            console.log("Image download error:", error);
+
+            if (!res.headersSent) {
+                res.status(404).json({
+                    message: "Image not found"
+                });
+            }
         });
 
         downloadStream.pipe(res);
@@ -1008,6 +1225,27 @@ export const getDoctorImage = async (req, res) => {
         });
     }
 };
+
+
+
+// Get patient profile
+export const getPatientProfile = async (req, res) => {
+    try {
+        const user = await User.findById(req.user.id).select("-password");
+
+        res.status(200).json({
+            message: "Profile fetched successfully",
+            profile: user
+        });
+
+    } catch (error) {
+        res.status(500).json({
+            message: "Unable to fetch profile"
+        });
+    }
+};
+
+
 
 
 
