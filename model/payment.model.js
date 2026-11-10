@@ -48,6 +48,10 @@ const paymentSchema = new mongoose.Schema(
         razorpayRefundId: {
             type: String,
             default: null
+        },
+        expiresAt: {
+            type: Date,
+            required: true
         }
     },
     {

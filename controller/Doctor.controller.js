@@ -11,6 +11,7 @@ import Razorpay from "razorpay";
 import crypto from "crypto";
 import { Payment } from "../model/payment.model.js";
 import { Appointment } from "../model/appointment.model.js";
+import cron from "node-cron";
 const getTodayDate = () => {
     return new Date().toLocaleDateString("en-CA", {
         timeZone: "Asia/Kolkata"
@@ -22,6 +23,144 @@ const razorpay = new Razorpay({
     key_secret: process.env.RAZORPAY_KEY_SECRET
 });
 
+const cleanupExpiredPayments = async () => {
+    try {
+        const expiredPayments = await Payment.find({
+            status: "created",
+            expiresAt: { $lte: new Date() }
+        });
+
+        for (const payment of expiredPayments) {
+            try {
+                // Check Razorpay before releasing the slot
+                const orderPayments =
+                    await razorpay.orders.fetchPayments(
+                        payment.razorpayOrderId
+                    );
+
+                const capturedPayment = orderPayments.items?.find(
+                    (item) => item.status === "captured"
+                );
+
+                const authorizedPayment = orderPayments.items?.find(
+                    (item) => item.status === "authorized"
+                );
+
+                // Payment captured: keep the reservation and mark paid
+                if (capturedPayment) {
+                    const updatedPayment =
+                        await Payment.findOneAndUpdate(
+                            {
+                                _id: payment._id,
+                                status: "created"
+                            },
+                            {
+                                $set: {
+                                    status: "paid",
+                                    razorpayPaymentId: capturedPayment.id
+                                }
+                            },
+                            { new: true }
+                        );
+
+                    // If another request already changed the payment,
+                    // don't overwrite that result.
+                    if (!updatedPayment) continue;
+
+                    continue;
+                }
+
+                // Authorized payments may still be captured.
+                // Give them another 2 minutes before checking again.
+                if (authorizedPayment) {
+                    await Payment.findOneAndUpdate(
+                        {
+                            _id: payment._id,
+                            status: "created"
+                        },
+                        {
+                            $set: {
+                                expiresAt: new Date(
+                                    Date.now() + 2 * 60 * 1000
+                                )
+                            }
+                        }
+                    );
+
+                    continue;
+                }
+
+                // No successful payment: mark it failed first.
+                const failedPayment =
+                    await Payment.findOneAndUpdate(
+                        {
+                            _id: payment._id,
+                            status: "created"
+                        },
+                        {
+                            $set: {
+                                status: "failed"
+                            }
+                        },
+                        { new: true }
+                    );
+
+                // Another request may have verified payment meanwhile.
+                if (!failedPayment) continue;
+
+                // Cancel appointment history
+                await Appointment.findOneAndUpdate(
+                    {
+                        paymentId: payment._id,
+                        status: "pending"
+                    },
+                    {
+                        $set: {
+                            status: "cancelled",
+                            cancelledBy: "patient",
+                            cancelledAt: new Date()
+                        }
+                    }
+                );
+
+                // Release only this patient's original reservation
+                await Slot.findOneAndUpdate(
+                    {
+                        _id: payment.slotId,
+                        patientId: payment.patientId,
+                        status: "booked",
+                        appointmentStatus: "pending"
+                    },
+                    {
+                        $set: {
+                            status: "available",
+                            patientId: null,
+                            appointmentStatus: "cancelled"
+                        }
+                    }
+                );
+
+                console.log(
+                    "Expired payment cleaned:",
+                    payment.razorpayOrderId
+                );
+
+            } catch (error) {
+                console.log(
+                    "Individual payment cleanup error:",
+                    payment.razorpayOrderId,
+                    error
+                );
+            }
+        }
+
+    } catch (error) {
+        console.log("Payment cleanup error:", error);
+    }
+};
+cron.schedule("* * * * *", () => {
+    cleanupExpiredPayments();
+});
 export const Register = async (req, res) => {
     try {
         const { name, email, password } = req.body;
@@ -678,12 +817,26 @@ export const bookAppointment = async (req, res) => {
 
 
 
+
 export const getMyAppointments = async (req, res) => {
     try {
         const patientId = req.user.id;
 
+        // 1. Find only successful payments
+        const paidPayments = await Payment.find({
+            patientId,
+            status: "paid"
+        }).select("slotId");
+
+        // 2. Get slot IDs from successful payments
+        const paidSlotIds = paidPayments.map(
+            (payment) => payment.slotId
+        );
+
+        // 3. Fetch only booked slots with successful payments
         const appointments = await Slot.find({
-            patientId: patientId,
+            _id: { $in: paidSlotIds },
+            patientId,
             status: "booked"
         })
             .populate("doctorId", "name")
@@ -706,6 +859,7 @@ export const getMyAppointments = async (req, res) => {
         });
     }
 };
+
 
 
 
@@ -1000,12 +1154,26 @@ export const createPaymentOrder = async (req, res) => {
     try {
         const { slotId } = req.params;
 
+        // Check whether the patient already has an active payment
+        const existingPayment = await Payment.findOne({
+            patientId,
+            status: "created",
+            expiresAt: { $gt: new Date() }
+        });
+
+        if (existingPayment) {
+            return res.status(400).json({
+                message: "You already have a pending payment. Please complete it first."
+            });
+        }
+
         // 1. Find available slot
         const slot = await Slot.findOne({
             _id: slotId,
             status: "available"
         });
 
+        // Continue with your existing code...
         if (!slot) {
             return res.status(404).json({
                 message: "This slot is not available"
@@ -1065,6 +1233,8 @@ export const createPaymentOrder = async (req, res) => {
             receipt: `slot_${bookedSlot._id}`
         });
 
+        // Payment expires after 1 minute
+        const expiresAt = new Date(Date.now() + 30 * 1000);
         // 6. Create Payment document
         const payment = await Payment.create({
             patientId,
@@ -1072,7 +1242,8 @@ export const createPaymentOrder = async (req, res) => {
             slotId: bookedSlot._id,
             amount,
             razorpayOrderId: order.id,
-            status: "created"
+            status: "created",
+            expiresAt
         });
 
         createdPaymentId = payment._id;
@@ -1097,9 +1268,9 @@ export const createPaymentOrder = async (req, res) => {
             orderId: order.id,
             amount: order.amount,
             currency: order.currency,
-            keyId: process.env.RAZORPAY_KEY_ID
+            keyId: process.env.RAZORPAY_KEY_ID,
+            expiresAt
         });
-
     } catch (error) {
         console.log("Create payment order error:", error);
 
@@ -1149,6 +1320,42 @@ export const createPaymentOrder = async (req, res) => {
 };
 
 
+const refundLatePayment = async (payment) => {
+    const existingRefunds =
+        await razorpay.payments.fetchMultipleRefund(
+            payment.razorpayPaymentId
+        );
+
+    if (existingRefunds.items?.length > 0) {
+        const refund = existingRefunds.items[0];
+
+        payment.razorpayRefundId = refund.id;
+        payment.refundStatus =
+            refund.status === "processed"
+                ? "processed"
+                : refund.status === "failed"
+                    ? "failed"
+                    : "pending";
+
+        await payment.save();
+
+        return;
+    }
+
+    const refund = await razorpay.payments.refund(
+        payment.razorpayPaymentId
+    );
+
+    payment.razorpayRefundId = refund.id;
+    payment.refundStatus =
+        refund.status === "processed"
+            ? "processed"
+            : refund.status === "failed"
+                ? "failed"
+                : "pending";
+
+    await payment.save();
+};
 
 
 export const verifyPayment = async (req, res) => {
@@ -1161,7 +1368,6 @@ export const verifyPayment = async (req, res) => {
 
         const patientId = req.user.id;
 
-        // 1. Check required details
         if (
             !razorpay_order_id ||
             !razorpay_payment_id ||
@@ -1172,7 +1378,7 @@ export const verifyPayment = async (req, res) => {
             });
         }
 
-        // 2. Find payment record
+        // 1. Find payment
         const payment = await Payment.findOne({
             razorpayOrderId: razorpay_order_id,
             patientId
@@ -1184,27 +1390,7 @@ export const verifyPayment = async (req, res) => {
             });
         }
 
-        if (payment.status === "paid") {
-            return res.status(400).json({
-                message: "Payment already completed"
-            });
-        }
-
-        // 3. Check the appointment
-        const slot = await Slot.findOne({
-            _id: payment.slotId,
-            patientId,
-            status: "booked",
-            appointmentStatus: "pending"
-        });
-
-        if (!slot) {
-            return res.status(404).json({
-                message: "Booked appointment not found"
-            });
-        }
-
-        // 4. Generate payment signature
+        // 2. Verify signature
         const generatedSignature = crypto
             .createHmac(
                 "sha256",
@@ -1215,19 +1401,85 @@ export const verifyPayment = async (req, res) => {
             )
             .digest("hex");
 
-        // 5. Verify signature
-        if (generatedSignature !== razorpay_signature) {
+        const signatureBuffer = Buffer.from(generatedSignature);
+        const receivedSignatureBuffer = Buffer.from(razorpay_signature);
+
+        if (
+            signatureBuffer.length !== receivedSignatureBuffer.length ||
+            !crypto.timingSafeEqual(
+                signatureBuffer,
+                receivedSignatureBuffer
+            )
+        ) {
             return res.status(400).json({
                 message: "Invalid payment signature"
             });
         }
 
-        // 6. Update payment details
+        // 3. Verify actual payment with Razorpay
+        const razorpayPayment = await razorpay.payments.fetch(
+            razorpay_payment_id
+        );
+
+        if (
+            razorpayPayment.order_id !== razorpay_order_id ||
+            razorpayPayment.status !== "captured"
+        ) {
+            return res.status(400).json({
+                message: "Payment is not captured"
+            });
+        }
+
+        // 4. Find original appointment and slot
+        const appointment = await Appointment.findOne({
+            paymentId: payment._id,
+            patientId
+        });
+
+        const slot = await Slot.findOne({
+            _id: payment.slotId,
+            patientId,
+            status: "booked",
+            appointmentStatus: "pending"
+        });
+
+        const isAppointmentActive =
+            appointment &&
+            appointment.status === "pending" &&
+            slot &&
+            payment.expiresAt > new Date();
+
+        // 5. Record successful payment
         payment.razorpayPaymentId = razorpay_payment_id;
         payment.razorpaySignature = razorpay_signature;
         payment.status = "paid";
 
         await payment.save();
+
+        // 6. If appointment was cancelled or expired, refund payment
+        if (!isAppointmentActive) {
+            if (appointment && appointment.status === "pending") {
+                appointment.status = "cancelled";
+                appointment.cancelledBy = "patient";
+                appointment.cancelledAt = new Date();
+                await appointment.save();
+            }
+
+            if (slot) {
+                slot.status = "available";
+                slot.patientId = null;
+                slot.appointmentStatus = "cancelled";
+                await slot.save();
+            }
+
+            await refundLatePayment(payment);
+
+            return res.status(200).json({
+                message: "Payment was received after the reservation expired. A refund has been initiated.",
+                paymentStatus: "paid",
+                refundStatus: payment.refundStatus
+            });
+        }
 
         return res.status(200).json({
             message: "Payment successful",
@@ -1242,7 +1494,6 @@ export const verifyPayment = async (req, res) => {
         });
     }
 };
-
 
 
 
@@ -1371,7 +1622,6 @@ export const cancelPendingPayment = async (req, res) => {
         const { slotId } = req.params;
         const patientId = req.user.id;
 
-        // 1. Find pending payment
         const payment = await Payment.findOne({
             slotId,
             patientId,
@@ -1384,74 +1634,16 @@ export const cancelPendingPayment = async (req, res) => {
             });
         }
 
-        // 2. Check Razorpay before releasing the slot
-        const orderPayments = await razorpay.orders.fetchPayments(
-            payment.razorpayOrderId
-        );
-
-        const hasSuccessfulPayment = orderPayments.items?.some(
-            (item) =>
-                item.status === "captured" ||
-                item.status === "authorized"
-        );
-
-        if (hasSuccessfulPayment) {
-            return res.status(409).json({
-                message: "Payment is processing. Please refresh your appointments."
-            });
-        }
-
-        // 3. Mark payment as failed
-        payment.status = "failed";
-        await payment.save();
-
-        // 4. Update the matching Appointment
-        const appointment = await Appointment.findOne({
-            paymentId: payment._id,
-            patientId
-        });
-
-        if (appointment) {
-            appointment.status = "cancelled";
-            appointment.cancelledBy = "patient";
-            appointment.cancelledAt = new Date();
-
-            await appointment.save();
-        }
-
-        // 5. Release the slot
-        const slot = await Slot.findOneAndUpdate(
-            {
-                _id: slotId,
-                patientId,
-                status: "booked",
-                appointmentStatus: "pending"
-            },
-            {
-                $set: {
-                    status: "available",
-                    patientId: null,
-                    appointmentStatus: "cancelled"
-                }
-            },
-            { new: true }
-        );
-
-        if (!slot) {
-            return res.status(409).json({
-                message: "Slot could not be released"
-            });
-        }
-
         return res.status(200).json({
-            message: "Unpaid reservation cancelled. Slot is available again."
+            message: "Payment cancellation received. Your slot will remain reserved until the payment expiry time.",
+            expiresAt: payment.expiresAt
         });
 
     } catch (error) {
         console.log("Cancel pending payment error:", error);
 
         return res.status(500).json({
-            message: "Could not cancel pending payment"
+            message: "Could not process payment cancellation"
         });
     }
 };
