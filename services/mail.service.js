@@ -47,7 +47,7 @@ export const sendRegistrationEmail = async (email, name, activationToken) => {
 // Password reset email
 export const sendPasswordResetEmail = async (email, name, resetToken) => {
 
-    const resetLink = `https://doctor-be-gbwe.onrender.com/reset/${resetToken}`;
+    const resetLink = `https://appoinmentsystem.netlify.app/reset/${resetToken}`;
 
     const result = await brevo.transactionalEmails.sendTransacEmail({
         subject: "MediSlot - Password Reset",
