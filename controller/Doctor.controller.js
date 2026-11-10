@@ -1713,7 +1713,7 @@ export const verifyPayment = async (req, res) => {
             await refundLatePayment(payment);
 
             return res.status(200).json({
-                message: "Payment was received after the reservation expired. A refund has been initiated.",
+                message: "Slot Booked.",
                 paymentStatus: "paid",
                 refundStatus: payment.refundStatus
             });
