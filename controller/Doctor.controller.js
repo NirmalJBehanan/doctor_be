@@ -1472,7 +1472,7 @@ export const createPaymentOrder = async (req, res) => {
         });
 
         // Payment expires after 1 minute
-        const expiresAt = new Date(Date.now() + 30 * 1000);
+        const expiresAt = new Date(Date.now() + 1 * 60 * 1000);
         // 6. Create Payment document
         const payment = await Payment.create({
             patientId,
