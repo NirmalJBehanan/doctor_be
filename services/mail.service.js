@@ -10,7 +10,7 @@ const brevo = new BrevoClient({
 
 // Registration email
 export const sendRegistrationEmail = async (email, name, activationToken) => {
-
+   const activate=`https://appoinmentsystem.netlify.app/activate/${activationToken}`;
     const result = await brevo.transactionalEmails.sendTransacEmail({
         subject: "Registration Successful - Verify Your Account",
 
@@ -32,7 +32,7 @@ export const sendRegistrationEmail = async (email, name, activationToken) => {
 
             <p>Click the link below to activate your account:</p>
 
-            <a href="${process.env.FRONTEND_URL}/activate/${activationToken}">
+            <a href="${activate}">
                 Activate Account
             </a>
 
