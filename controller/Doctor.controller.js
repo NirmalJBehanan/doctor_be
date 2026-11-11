@@ -1081,11 +1081,12 @@ export const cancelAppointment = async (req, res) => {
         }
 
         if (
+            slot.appointmentStatus === "confirmed" ||
             slot.appointmentStatus === "completed" ||
             slot.appointmentStatus === "cancelled"
         ) {
             return res.status(400).json({
-                message: "This appointment cannot be cancelled"
+                message: "You cannot cancel an appointment after the doctor confirms it"
             });
         }
 
@@ -1094,7 +1095,7 @@ export const cancelAppointment = async (req, res) => {
             slotId: slot._id,
             patientId,
             doctorId: slot.doctorId,
-            status: { $in: ["pending", "confirmed"] }
+            status: "pending"
         }).sort({ createdAt: -1 });
 
         if (!appointment) {
